@@ -1,0 +1,14 @@
+# Edit this file before the first real run.
+
+# Released AD-GMRS resources required for routine prediction
+AD_GMRS_WEIGHTS_DIR=/path/to/AD-GMRS.weights
+AD_GMRS_MODEL_FILE=/path/to/AD-GMRS.model.tsv
+
+# Optional only if weight_manifest.tsv is not stored inside AD_GMRS_WEIGHTS_DIR
+# AD_GMRS_WEIGHT_MANIFEST=/path/to/weight_manifest.tsv
+
+# Optional public reference paths used only when rebuilding the weights internally
+# AD_GMRS_PRSCS_PY=/path/to/PRScs.py
+# AD_GMRS_REF_DIR=/path/to/ldblk_1kg_EUR
+# AD_GMRS_BIM_TEMPLATE=/path/to/eur_chr{chr}
+# AD_GMRS_PRSCS_MANIFEST=/path/to/prscs_manifest.tsv
