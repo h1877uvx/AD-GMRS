@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$ROOT_DIR/AD-GMRS.script"
+DEFAULT_RESULT_DIR="$ROOT_DIR/AD-GMRS.result"
+DEFAULT_CONFIG="$SCRIPT_DIR/AD-GMRS.path"
+DEFAULT_PROFILE="$SCRIPT_DIR/AD-GMRS.profile.txt"
+DEFAULT_R_SCRIPT="$SCRIPT_DIR/AD-GMRS.R"
+
+usage() {
+  cat <<'EOF'
+AD-GMRS: Genotype-based Molecular Risk Score for Atopic Dermatitis
+
+Usage:
+  AD-GMRS --geno <genotype_chr{chr}> [options]
+
+Required:
+  --geno <genotype_chr{chr}>    PLINK binary prefix template. Use {chr} as the chromosome placeholder.
+
+Common options:
+  --outdir <dir>                Output directory. Default: AD-GMRS.result/
+  --keep <keep_file>            Optional PLINK keep file for sample selection
+  --config <path>               Optional config file. Default: AD-GMRS.script/AD-GMRS.path
+
+Advanced overrides:
+  --weights <weights_dir>       Override AD_GMRS_WEIGHTS_DIR
+  --model <model.tsv>           Override AD_GMRS_MODEL_FILE
+  --manifest <weight_manifest>  Override AD_GMRS_WEIGHT_MANIFEST
+  --profile-reference <file>    Override AD-GMRS.script/AD-GMRS.profile.txt
+
+First run:
+  1. Edit AD-GMRS.script/AD-GMRS.path
+  2. Fill in the released AD-GMRS resource paths
+  3. Run AD-GMRS --geno <genotype_chr{chr}>
+
+Notes:
+  - AD-GMRS is a prediction-focused release
+  - A single run calculates feature scores, standardizes them, and outputs AD risk scores
+  - The default profile reference is AD-GMRS.script/AD-GMRS.profile.txt
+  - AD-GMRS reads AD-GMRS.script/AD-GMRS.path directly
+  - The released weight directory should contain weight_manifest.tsv, or set AD_GMRS_WEIGHT_MANIFEST explicitly
+  - The default output directory is AD-GMRS.result/
+  - If AD-GMRS is not in your PATH, run it as ./AD-GMRS
+EOF
+}
+
+detect_config_path() {
+  local config_path="$DEFAULT_CONFIG"
+  local expect_value=0
+  local arg
+
+  for arg in "$@"; do
+    if [[ "$expect_value" -eq 1 ]]; then
+      config_path="$arg"
+      break
+    fi
+    if [[ "$arg" == "--config" ]]; then
+      expect_value=1
+    fi
+  done
+
+  printf '%s\n' "$config_path"
+}
+
+load_config() {
+  local config_path="$1"
+  if [[ ! -f "$config_path" ]]; then
+    echo "Config file not found: $config_path" >&2
+    exit 1
+  fi
+  # shellcheck disable=SC1090
+  source "$config_path"
+}
+
+ensure_file() {
+  local path="$1"
+  local label="$2"
+  if [[ ! -f "$path" ]]; then
+    echo "$label not found: $path" >&2
+    exit 1
+  fi
+}
+
+ensure_dir() {
+  local path="$1"
+  local label="$2"
+  if [[ ! -d "$path" ]]; then
+    echo "$label not found: $path" >&2
+    exit 1
+  fi
+}
+
+score_profiles() {
+  local bfile_template="$1"
+  local weight_manifest="$2"
+  local weights_dir="$3"
+  local outdir="$4"
+  local plink_bin="$5"
+  local keep_file="$6"
+  local jobs="$7"
+  local threads="$8"
+  local snp_col="$9"
+  local allele_col="${10}"
+  local beta_col="${11}"
+
+  mkdir -p "$outdir"
+  local tmp_dir="$outdir/tmp"
+  mkdir -p "$tmp_dir"
+
+  resolve_weight_path() {
+    local candidate="$1"
+    if [[ "$candidate" = /* ]]; then
+      printf '%s\n' "$candidate"
+    else
+      printf '%s\n' "$weights_dir/$candidate"
+    fi
+  }
+
+  run_one() {
+    local feature_id="$1"
+    local chr="$2"
+    local weight_file="$3"
+    local weight_path
+    local bfile_prefix
+    local safe_feature
+    local snp_file
+
+    weight_path="$(resolve_weight_path "$weight_file")"
+    if [[ ! -f "$weight_path" ]]; then
+      echo "Weight file not found: $weight_path" >&2
+      exit 1
+    fi
+
+    bfile_prefix="${bfile_template//\{chr\}/$chr}"
+    safe_feature="$(printf '%s' "$feature_id" | sed 's/[^A-Za-z0-9._-]/_/g')"
+    snp_file="$tmp_dir/${safe_feature}.snp"
+
+    cut -f"$snp_col" "$weight_path" > "$snp_file"
+
+    if [[ -n "$keep_file" ]]; then
+      "$plink_bin" \
+        --bfile "$bfile_prefix" \
+        --keep "$keep_file" \
+        --extract "$snp_file" \
+        --out "$outdir/$feature_id" \
+        --score "$weight_path" "$snp_col" "$allele_col" "$beta_col" sum \
+        --threads "$threads"
+    else
+      "$plink_bin" \
+        --bfile "$bfile_prefix" \
+        --extract "$snp_file" \
+        --out "$outdir/$feature_id" \
+        --score "$weight_path" "$snp_col" "$allele_col" "$beta_col" sum \
+        --threads "$threads"
+    fi
+
+    rm -f "$snp_file"
+  }
+
+  while IFS=$'\t' read -r feature_id chr weight_file; do
+    [[ "$feature_id" == "feature_id" ]] && continue
+    [[ -z "$feature_id" ]] && continue
+
+    run_one "$feature_id" "$chr" "$weight_file" &
+    while [[ "$(jobs -pr | wc -l | tr -d ' ')" -ge "$jobs" ]]; do
+      sleep 1
+    done
+  done < "$weight_manifest"
+
+  wait
+}
+
+predict_command() {
+  local config_path
+  config_path="$(detect_config_path "$@")"
+  load_config "$config_path"
+
+  local geno_template=""
+  local weights_dir="${AD_GMRS_WEIGHTS_DIR:-}"
+  local model_file="${AD_GMRS_MODEL_FILE:-}"
+  local weight_manifest="${AD_GMRS_WEIGHT_MANIFEST:-}"
+  local profile_reference="${AD_GMRS_PROFILE_REFERENCE:-$DEFAULT_PROFILE}"
+  local outdir="$DEFAULT_RESULT_DIR"
+  local plink_bin="${AD_GMRS_PLINK_BIN:-plink}"
+  local keep_file=""
+  local jobs="${AD_GMRS_JOBS:-1}"
+  local threads="${AD_GMRS_THREADS:-1}"
+  local snp_col=2
+  local allele_col=4
+  local beta_col=6
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --config) shift 2 ;;
+      --geno|--bfile-template) geno_template="$2"; shift 2 ;;
+      --weights|--weights-dir) weights_dir="$2"; shift 2 ;;
+      --model) model_file="$2"; shift 2 ;;
+      --manifest|--weight-manifest) weight_manifest="$2"; shift 2 ;;
+      --profile-reference) profile_reference="$2"; shift 2 ;;
+      --outdir) outdir="$2"; shift 2 ;;
+      --plink-bin) plink_bin="$2"; shift 2 ;;
+      --keep) keep_file="$2"; shift 2 ;;
+      --jobs) jobs="$2"; shift 2 ;;
+      --threads) threads="$2"; shift 2 ;;
+      --snp-col) snp_col="$2"; shift 2 ;;
+      --allele-col) allele_col="$2"; shift 2 ;;
+      --beta-col) beta_col="$2"; shift 2 ;;
+      --help|-h) usage; exit 0 ;;
+      *) echo "Unknown argument for predict: $1" >&2; usage; exit 1 ;;
+    esac
+  done
+
+  if [[ -z "$weight_manifest" && -n "$weights_dir" && -f "$weights_dir/weight_manifest.tsv" ]]; then
+    weight_manifest="$weights_dir/weight_manifest.tsv"
+  fi
+
+  if [[ -z "$geno_template" ]]; then
+    echo "predict requires --geno." >&2
+    usage
+    exit 1
+  fi
+
+  if [[ -z "$weights_dir" || -z "$model_file" ]]; then
+    echo "Please edit AD-GMRS.script/AD-GMRS.path and define AD_GMRS_WEIGHTS_DIR and AD_GMRS_MODEL_FILE before running predict." >&2
+    usage
+    exit 1
+  fi
+
+  if [[ -z "$weight_manifest" ]]; then
+    echo "Could not find weight_manifest.tsv. Please set AD_GMRS_WEIGHT_MANIFEST in AD-GMRS.script/AD-GMRS.path or place weight_manifest.tsv inside AD_GMRS_WEIGHTS_DIR." >&2
+    exit 1
+  fi
+
+  ensure_file "$weight_manifest" "Weight manifest"
+  ensure_file "$profile_reference" "Profile reference"
+  ensure_file "$model_file" "Model coefficient file"
+  ensure_dir "$weights_dir" "Weights directory"
+
+  mkdir -p "$outdir"
+  local raw_score_dir="$outdir/raw_scores"
+  local out_prefix="$outdir/ad_gmrs_profiles"
+
+  score_profiles \
+    "$geno_template" \
+    "$weight_manifest" \
+    "$weights_dir" \
+    "$raw_score_dir" \
+    "$plink_bin" \
+    "$keep_file" \
+    "$jobs" \
+    "$threads" \
+    "$snp_col" \
+    "$allele_col" \
+    "$beta_col"
+
+  Rscript "$DEFAULT_R_SCRIPT" predict \
+    --score-dir "$raw_score_dir" \
+    --profile-reference "$profile_reference" \
+    --model "$model_file" \
+    --out-prefix "$out_prefix" \
+    --risk-output "$outdir/ad_gmrs_risk_scores.tsv"
+
+  echo "AD-GMRS run finished:"
+  echo "  Raw matrix: $out_prefix.raw.tsv"
+  echo "  Standardized matrix: $out_prefix.standardized.tsv"
+  echo "  Risk scores: $outdir/ad_gmrs_risk_scores.tsv"
+}
+
+main() {
+  if [[ $# -eq 0 ]]; then
+    usage
+    exit 0
+  fi
+
+  case "${1:-}" in
+    help|-h|--help)
+      usage
+      exit 0
+      ;;
+    predict)
+      shift
+      ;;
+    train-model|train-weights|example)
+      echo "The released AD-GMRS entrypoint is prediction-focused." >&2
+      echo "Please run: AD-GMRS --geno <genotype_chr{chr}>" >&2
+      exit 1
+      ;;
+  esac
+
+  predict_command "$@"
+}
+
+main "$@"
